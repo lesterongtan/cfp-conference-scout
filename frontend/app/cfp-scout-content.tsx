@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
@@ -14,6 +15,22 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+
+const EVENT_FORMAT_OPTIONS = [
+  { value: "virtual", label: "Virtual" },
+  { value: "in_person", label: "In-person" },
+  { value: "hybrid", label: "Hybrid" },
+];
+
+const DEFAULT_MIN_DAYS_OUT = 180;
+const DEFAULT_MAX_DAYS_OUT = 365;
+
+function splitList(value: string): string[] {
+  return value
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
 
 // Raised from 50: at 50, the events lane (many more candidates) filled the
 // cap before slower directory-lane results (e.g. 10times via Apify) ever
@@ -38,6 +55,7 @@ interface CfpResult {
   contact_source: string;
   submission_form_url: string;
   event_type: string;
+  event_format: string;
   venue_name: string;
   promoter_name: string;
   promoter_website: string;
@@ -54,6 +72,22 @@ export function CfpScoutContent() {
   const [confsTechItemsFound, setConfsTechItemsFound] = useState(0);
   const [error, setError] = useState("");
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Profile — Phase 1 discovery inputs (niches/topics/expertise/audiences/
+  // geography/date window/formats/exclusions). Purely used to shape query
+  // generation and filtering, never for scoring/ranking candidates.
+  const [showProfile, setShowProfile] = useState(false);
+  const [primaryNiche, setPrimaryNiche] = useState("");
+  const [secondaryNiches, setSecondaryNiches] = useState("");
+  const [speakingTopics, setSpeakingTopics] = useState("");
+  const [expertiseKeywords, setExpertiseKeywords] = useState("");
+  const [audiences, setAudiences] = useState("");
+  const [geography, setGeography] = useState("");
+  const [countryCode, setCountryCode] = useState("WW");
+  const [minDaysOut, setMinDaysOut] = useState(String(DEFAULT_MIN_DAYS_OUT));
+  const [maxDaysOut, setMaxDaysOut] = useState(String(DEFAULT_MAX_DAYS_OUT));
+  const [eventFormats, setEventFormats] = useState<string[]>([]);
+  const [exclusions, setExclusions] = useState("");
 
   useEffect(() => {
     return () => {
@@ -93,15 +127,52 @@ export function CfpScoutContent() {
   };
 
   const runScout = async () => {
-    const keywords = keywordsInput
-      .split(",")
-      .map((k) => k.trim())
-      .filter(Boolean);
+    const keywords = splitList(keywordsInput);
 
-    if (keywords.length === 0) {
-      setError("Enter at least one keyword (comma-separated).");
+    const secondaryNichesList = splitList(secondaryNiches);
+    const speakingTopicsList = splitList(speakingTopics);
+    const expertiseKeywordsList = splitList(expertiseKeywords);
+    const audiencesList = splitList(audiences);
+    const exclusionsList = splitList(exclusions);
+
+    const hasProfileTerms =
+      primaryNiche.trim() ||
+      secondaryNichesList.length > 0 ||
+      speakingTopicsList.length > 0 ||
+      expertiseKeywordsList.length > 0 ||
+      audiencesList.length > 0;
+
+    if (keywords.length === 0 && !hasProfileTerms) {
+      setError(
+        "Enter at least one keyword, or fill in a niche/topic/expertise/audience in the profile.",
+      );
       return;
     }
+
+    const hasProfileValues =
+      hasProfileTerms ||
+      geography.trim() ||
+      countryCode.trim() !== "WW" ||
+      Number(minDaysOut) !== DEFAULT_MIN_DAYS_OUT ||
+      Number(maxDaysOut) !== DEFAULT_MAX_DAYS_OUT ||
+      eventFormats.length > 0 ||
+      exclusionsList.length > 0;
+
+    const profile = hasProfileValues
+      ? {
+          primary_niche: primaryNiche.trim(),
+          secondary_niches: secondaryNichesList,
+          speaking_topics: speakingTopicsList,
+          expertise_keywords: expertiseKeywordsList,
+          audiences: audiencesList,
+          geography: geography.trim(),
+          country_code: countryCode.trim() || "WW",
+          min_days_out: Number(minDaysOut) || DEFAULT_MIN_DAYS_OUT,
+          max_days_out: Number(maxDaysOut) || DEFAULT_MAX_DAYS_OUT,
+          event_formats: eventFormats,
+          exclusions: exclusionsList,
+        }
+      : undefined;
 
     setError("");
     setResults([]);
@@ -114,7 +185,7 @@ export function CfpScoutContent() {
       const res = await fetch("/api/cfp-scout/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ keywords, max_results: MAX_RESULTS }),
+        body: JSON.stringify({ keywords, max_results: MAX_RESULTS, profile }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -126,6 +197,12 @@ export function CfpScoutContent() {
       setError(err instanceof Error ? err.message : "Failed to start scout");
       setStatus("error");
     }
+  };
+
+  const toggleEventFormat = (value: string) => {
+    setEventFormats((prev) =>
+      prev.includes(value) ? prev.filter((v) => v !== value) : [...prev, value],
+    );
   };
 
   return (
@@ -149,6 +226,161 @@ export function CfpScoutContent() {
               }}
             />
           </div>
+
+          <button
+            type="button"
+            onClick={() => setShowProfile((v) => !v)}
+            className="text-sm font-medium text-primary hover:underline"
+          >
+            {showProfile ? "Hide profile ▲" : "Advanced: speaker profile ▼"}
+          </button>
+
+          {showProfile && (
+            <div className="space-y-4 rounded-md border p-4">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Primary niche</label>
+                  <Input
+                    value={primaryNiche}
+                    onChange={(e) => setPrimaryNiche(e.target.value)}
+                    placeholder="e.g. healthcare"
+                    disabled={status === "running"}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">
+                    Secondary niches{" "}
+                    <span className="text-muted-foreground font-normal">(comma-separated)</span>
+                  </label>
+                  <Input
+                    value={secondaryNiches}
+                    onChange={(e) => setSecondaryNiches(e.target.value)}
+                    placeholder="e.g. fintech, edtech"
+                    disabled={status === "running"}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">
+                    Speaking topics{" "}
+                    <span className="text-muted-foreground font-normal">(comma-separated)</span>
+                  </label>
+                  <Textarea
+                    value={speakingTopics}
+                    onChange={(e) => setSpeakingTopics(e.target.value)}
+                    placeholder="e.g. AI adoption, patient experience"
+                    disabled={status === "running"}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">
+                    Expertise keywords{" "}
+                    <span className="text-muted-foreground font-normal">(comma-separated)</span>
+                  </label>
+                  <Textarea
+                    value={expertiseKeywords}
+                    onChange={(e) => setExpertiseKeywords(e.target.value)}
+                    placeholder="e.g. clinical operations, ML"
+                    disabled={status === "running"}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">
+                    Audiences{" "}
+                    <span className="text-muted-foreground font-normal">(comma-separated)</span>
+                  </label>
+                  <Input
+                    value={audiences}
+                    onChange={(e) => setAudiences(e.target.value)}
+                    placeholder="e.g. hospital executives, CTOs"
+                    disabled={status === "running"}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">
+                    Geography{" "}
+                    <span className="text-muted-foreground font-normal">
+                      (free text, appended to search queries)
+                    </span>
+                  </label>
+                  <Input
+                    value={geography}
+                    onChange={(e) => setGeography(e.target.value)}
+                    placeholder="e.g. Europe, United States"
+                    disabled={status === "running"}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">
+                    Directory country code{" "}
+                    <span className="text-muted-foreground font-normal">
+                      ("WW" = worldwide)
+                    </span>
+                  </label>
+                  <Input
+                    value={countryCode}
+                    onChange={(e) => setCountryCode(e.target.value.toUpperCase())}
+                    placeholder="WW"
+                    disabled={status === "running"}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Date window (days out)</label>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      type="number"
+                      min={0}
+                      value={minDaysOut}
+                      onChange={(e) => setMinDaysOut(e.target.value)}
+                      disabled={status === "running"}
+                    />
+                    <span className="text-muted-foreground text-sm">to</span>
+                    <Input
+                      type="number"
+                      min={0}
+                      value={maxDaysOut}
+                      onChange={(e) => setMaxDaysOut(e.target.value)}
+                      disabled={status === "running"}
+                    />
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Event formats</label>
+                  <div className="flex flex-wrap gap-3 pt-1">
+                    {EVENT_FORMAT_OPTIONS.map((opt) => (
+                      <label
+                        key={opt.value}
+                        className="flex items-center gap-1.5 text-sm font-normal"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={eventFormats.includes(opt.value)}
+                          onChange={() => toggleEventFormat(opt.value)}
+                          disabled={status === "running"}
+                        />
+                        {opt.label}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <div className="space-y-2 sm:col-span-2">
+                  <label className="text-sm font-medium">
+                    Exclusions{" "}
+                    <span className="text-muted-foreground font-normal">
+                      (comma-separated terms to drop — matched against name, description,
+                      promoter, domain)
+                    </span>
+                  </label>
+                  <Input
+                    value={exclusions}
+                    onChange={(e) => setExclusions(e.target.value)}
+                    placeholder="e.g. pharma, timeshare"
+                    disabled={status === "running"}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
           <div className="flex items-center gap-3">
             <Button onClick={runScout} disabled={status === "running"}>
               {status === "running" ? (
@@ -257,7 +489,10 @@ export function CfpScoutContent() {
                         )}
                       </TableCell>
                       <TableCell className="whitespace-normal break-words py-2 text-muted-foreground">
-                        {r.event_type || "—"}
+                        <div>{r.event_type || "—"}</div>
+                        {r.event_format && r.event_format !== "unknown" && (
+                          <div className="text-[10px] italic">{r.event_format}</div>
+                        )}
                       </TableCell>
                       <TableCell className="whitespace-normal py-2">
                         <Badge

@@ -36,6 +36,7 @@ import os
 import re
 import threading
 import time
+from functools import partial
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -58,9 +59,13 @@ _MAX_KEYWORDS = 8
 _SCRAPE_WORKERS = 8
 
 # "Active window" — event date must fall between these many days from today.
-# 6 months / 12 months, per the business requirement (not stale, not too far out).
-_MIN_DAYS_OUT = 180
-_MAX_DAYS_OUT = 365
+# 6 months / 12 months by default, per the original business requirement
+# (not stale, not too far out) — but overridable per-run via a profile's
+# date window. Passed as explicit function params throughout, never read
+# as bare globals: the app can serve concurrent scout runs, and mutating a
+# module-level global per-request would corrupt other runs in flight.
+_DEFAULT_MIN_DAYS_OUT = 180
+_DEFAULT_MAX_DAYS_OUT = 365
 
 _UA_HEADERS = {
     "User-Agent": (
@@ -93,22 +98,43 @@ _MONTH_DATE_FORMATS = [
 ]
 
 
-def _build_queries(keywords: list[str]) -> list[str]:
-    """Build CFP-flavored search queries from free-text keywords."""
+# Full event-type vocabulary from the Phase 1 discovery brief. Every query
+# used to hardcode the literal word "conference" — a real gap, since an
+# event that self-describes as a "Congress" or "Symposium" got no
+# deliberate query coverage at all.
+_EVENT_TYPE_TERMS = [
+    "conference", "convention", "summit", "symposium", "congress",
+    "forum", "annual meeting", "workshop", "expo",
+]
+
+
+def _build_queries(keywords: list[str], geography: str = "") -> list[str]:
+    """Build CFP-flavored search queries from free-text keywords.
+
+    Rotates two event-type terms per keyword across the query templates
+    (instead of only ever saying "conference"), so a multi-keyword profile
+    naturally spreads coverage across most of the vocabulary without a
+    combinatorial blowup in query count. `geography`, if given, is appended
+    as a plain search-text qualifier (e.g. "Europe", "United States") —
+    there's no structured location field for the free-text web-search lane.
+    """
     cleaned = [kw.strip() for kw in keywords if kw and kw.strip()][:_MAX_KEYWORDS]
     if not cleaned:
         cleaned = ["conference"]
 
     year = str(date.today().year)
     next_year = str(int(year) + 1)
+    geo_suffix = f" {geography.strip()}" if geography and geography.strip() else ""
 
     queries: list[str] = []
-    for kw in cleaned:
-        queries.append(f'{kw} "call for speakers" conference {year}')
-        queries.append(f'{kw} "call for speakers" conference {next_year}')
-        queries.append(f'{kw} conference "call for proposals" {year}')
-        queries.append(f'{kw} conference "call for papers" {year}')
-        queries.append(f'{kw} conference "speaker applications" open')
+    for i, kw in enumerate(cleaned):
+        et1 = _EVENT_TYPE_TERMS[(i * 2) % len(_EVENT_TYPE_TERMS)]
+        et2 = _EVENT_TYPE_TERMS[(i * 2 + 1) % len(_EVENT_TYPE_TERMS)]
+        queries.append(f'{kw} "call for speakers" {et1}{geo_suffix} {year}')
+        queries.append(f'{kw} "call for speakers" {et2}{geo_suffix} {next_year}')
+        queries.append(f'{kw} {et1} "call for proposals"{geo_suffix} {year}')
+        queries.append(f'{kw} {et2} "call for papers"{geo_suffix} {year}')
+        queries.append(f'{kw} {et1} "speaker applications" open{geo_suffix}')
 
     seen: set = set()
     deduped = []
@@ -188,18 +214,60 @@ def _parse_iso_date(date_str: str) -> Optional[date]:
         return None
 
 
-def _classify_window(event_date: Optional[date]) -> str:
-    """Classify a known event date against the 6-12 month active window."""
+def _classify_window(
+    event_date: Optional[date],
+    min_days_out: int = _DEFAULT_MIN_DAYS_OUT,
+    max_days_out: int = _DEFAULT_MAX_DAYS_OUT,
+) -> str:
+    """Classify a known event date against the active date window.
+
+    Takes the window bounds as explicit params (defaulting to the original
+    6-12 months) rather than reading module-level globals — the app can
+    serve concurrent scout runs with different profile date windows, and
+    mutating a shared global per-request would corrupt other runs in flight.
+    """
     if event_date is None:
         return "unknown"
     days_out = (event_date - date.today()).days
     if days_out < 0:
         return "expired"
-    if days_out < _MIN_DAYS_OUT:
+    if days_out < min_days_out:
         return "too_soon"
-    if days_out > _MAX_DAYS_OUT:
+    if days_out > max_days_out:
         return "too_far_out"
     return "in_window"
+
+
+_VIRTUAL_LOCATION_TERMS = ("virtual", "online", "webinar", "remote")
+_HYBRID_LOCATION_TERMS = ("hybrid",)
+
+
+def _infer_event_format(location: str, jsonld_attendance_mode: str = "") -> str:
+    """Best-effort virtual/in_person/hybrid classification.
+
+    No source in this pipeline reliably reports attendance mode as
+    structured data (10times only exposes it via the costlier
+    scrapeDetails=True mode we deliberately don't enable — see
+    _build_directory_input), so this is inferred from free text, not
+    verified. Returns "unknown" rather than guessing when there's nothing
+    to go on, so callers can choose not to drop unknowns during filtering.
+    """
+    mode = (jsonld_attendance_mode or "").lower()
+    if "mixed" in mode or "hybrid" in mode:
+        return "hybrid"
+    if "online" in mode:
+        return "virtual"
+    if "offline" in mode:
+        return "in_person"
+
+    text = (location or "").lower()
+    if any(term in text for term in _HYBRID_LOCATION_TERMS):
+        return "hybrid"
+    if any(term in text for term in _VIRTUAL_LOCATION_TERMS):
+        return "virtual"
+    if text.strip():
+        return "in_person"
+    return "unknown"
 
 
 # ── schema.org JSON-LD extraction (separate lightweight fetch) ──────────────
@@ -264,6 +332,7 @@ def _fetch_jsonld_event(url: str, timeout: int = 8) -> dict:
                     "start_date": obj.get("startDate", ""),
                     "location_name": _jsonld_location_name(obj.get("location")),
                     "price": _jsonld_price(obj.get("offers")),
+                    "attendance_mode": obj.get("eventAttendanceMode", "") or "",
                 }
     except Exception as exc:
         logger.debug(f"[CFP-SCOUT] JSON-LD parse failed for {url}: {exc}")
@@ -540,7 +609,14 @@ def _resolve_tentimes_category(keyword: str) -> str:
     return ""
 
 
-def _build_directory_input(actor_id: str, keyword: str, max_items: int = 30) -> Optional[dict]:
+def _build_directory_input(
+    actor_id: str,
+    keyword: str,
+    max_items: int = 30,
+    country: str = "WW",
+    min_days_out: int = _DEFAULT_MIN_DAYS_OUT,
+    max_days_out: int = _DEFAULT_MAX_DAYS_OUT,
+) -> Optional[dict]:
     """Build the actor's run input.
 
     Uses the verified schema automatically for the 10times actor. For any
@@ -552,10 +628,10 @@ def _build_directory_input(actor_id: str, keyword: str, max_items: int = 30) -> 
         category_id = _resolve_tentimes_category(keyword)
         run_input = {
             "category": category_id,  # "" = all categories
-            "country": "WW",
+            "country": country or "WW",
             "eventType": "conference",
-            "startDate": (today + timedelta(days=_MIN_DAYS_OUT)).isoformat(),
-            "endDate": (today + timedelta(days=_MAX_DAYS_OUT)).isoformat(),
+            "startDate": (today + timedelta(days=min_days_out)).isoformat(),
+            "endDate": (today + timedelta(days=max_days_out)).isoformat(),
             "maxItems": max_items,
             "onlineOnly": False,
             # False: we only use name/description/startDate/location, all of
@@ -591,7 +667,13 @@ def _build_directory_input(actor_id: str, keyword: str, max_items: int = 30) -> 
         return None
 
 
-def _search_directories(keywords: list[str], max_results: int = HARD_MAX_RESULTS) -> list[dict]:
+def _search_directories(
+    keywords: list[str],
+    max_results: int = HARD_MAX_RESULTS,
+    country: str = "WW",
+    min_days_out: int = _DEFAULT_MIN_DAYS_OUT,
+    max_days_out: int = _DEFAULT_MAX_DAYS_OUT,
+) -> list[dict]:
     """Directories lane — pulls from a structured event-directory Apify actor.
 
     Disabled (returns []) unless both APIFY_API_TOKEN and
@@ -627,7 +709,10 @@ def _search_directories(keywords: list[str], max_results: int = HARD_MAX_RESULTS
     # rediscovering that on every loop iteration.
     keyword_inputs: list[tuple[str, dict]] = []
     for kw in run_keywords:
-        run_input = _build_directory_input(actor_id, kw, max_items=max_items)
+        run_input = _build_directory_input(
+            actor_id, kw, max_items=max_items, country=country,
+            min_days_out=min_days_out, max_days_out=max_days_out,
+        )
         if run_input is None:
             return []
         keyword_inputs.append((kw, run_input))
@@ -666,7 +751,11 @@ def _search_directories(keywords: list[str], max_results: int = HARD_MAX_RESULTS
     return results
 
 
-def _process_directory_item(item: dict) -> Optional[dict]:
+def _process_directory_item(
+    item: dict,
+    min_days_out: int = _DEFAULT_MIN_DAYS_OUT,
+    max_days_out: int = _DEFAULT_MAX_DAYS_OUT,
+) -> Optional[dict]:
     """Directory items already carry name/date/location — verify + normalize.
 
     Only falls back to scrape_page() when the directory source's own data is
@@ -698,7 +787,7 @@ def _process_directory_item(item: dict) -> Optional[dict]:
         text_date_raw=scraped_date_raw,
         jsonld_start_date=structured_date_raw,
     )
-    window_status = _classify_window(event_date)
+    window_status = _classify_window(event_date, min_days_out, max_days_out)
     if window_status in ("expired", "too_far_out", "too_soon"):
         return None
 
@@ -723,6 +812,7 @@ def _process_directory_item(item: dict) -> Optional[dict]:
         "contact_source": contact["contact_source"],
         "submission_form_url": contact["submission_form_url"],
         "event_type": item.get("event_type", ""),
+        "event_format": _infer_event_format(location),
         "venue_name": item.get("venue_name", ""),
         "promoter_name": item.get("promoter_name", ""),
         "promoter_website": item.get("promoter_website", ""),
@@ -777,14 +867,19 @@ def _fetch_confs_tech_topic(year: int, topic: str) -> list[dict]:
         return []
 
 
-def _process_confs_tech_entry(entry: dict, topic: str) -> Optional[dict]:
+def _process_confs_tech_entry(
+    entry: dict,
+    topic: str,
+    min_days_out: int = _DEFAULT_MIN_DAYS_OUT,
+    max_days_out: int = _DEFAULT_MAX_DAYS_OUT,
+) -> Optional[dict]:
     name = entry.get("name", "")
     url = entry.get("url", "")
     if not name or not url:
         return None
 
     event_date = _parse_iso_date(entry.get("startDate", ""))
-    window_status = _classify_window(event_date)
+    window_status = _classify_window(event_date, min_days_out, max_days_out)
     if window_status in ("expired", "too_far_out", "too_soon"):
         return None
 
@@ -825,13 +920,18 @@ def _process_confs_tech_entry(entry: dict, topic: str) -> Optional[dict]:
         # Confs.tech is conference listings only — no tradeshow distinction
         # and no organizer/venue data in its schema.
         "event_type": "Conference",
+        "event_format": _infer_event_format(location),
         "venue_name": "",
         "promoter_name": "",
         "promoter_website": "",
     }
 
 
-def _search_confs_tech(keywords: list[str]) -> list[dict]:
+def _search_confs_tech(
+    keywords: list[str],
+    min_days_out: int = _DEFAULT_MIN_DAYS_OUT,
+    max_days_out: int = _DEFAULT_MAX_DAYS_OUT,
+) -> list[dict]:
     """Free discovery lane against the open-source Confs.tech dataset.
 
     Only fires for keywords matching a known tech topic — zero network
@@ -846,7 +946,7 @@ def _search_confs_tech(keywords: list[str]) -> list[dict]:
     for topic in topics:
         for year in (this_year, this_year + 1):
             for entry in _fetch_confs_tech_topic(year, topic):
-                processed = _process_confs_tech_entry(entry, topic)
+                processed = _process_confs_tech_entry(entry, topic, min_days_out, max_days_out)
                 if processed:
                     results.append(processed)
     logger.info(f"[CFP-SCOUT] Confs.tech: topics={topics} -> {len(results)} in-window results")
@@ -1087,7 +1187,11 @@ def _dedupe_by_domain(results: list[dict]) -> list[dict]:
     return [by_key[key] for key in order]
 
 
-def _process_event_url(item: tuple) -> Optional[dict]:
+def _process_event_url(
+    item: tuple,
+    min_days_out: int = _DEFAULT_MIN_DAYS_OUT,
+    max_days_out: int = _DEFAULT_MAX_DAYS_OUT,
+) -> Optional[dict]:
     url, source_backend = item
     scraped = scrape_page(url)
     if not scraped:
@@ -1101,12 +1205,13 @@ def _process_event_url(item: tuple) -> Optional[dict]:
         text_date_raw=scraped.get("event_date_raw", ""),
         jsonld_start_date=jsonld.get("start_date", ""),
     )
-    window_status = _classify_window(event_date)
+    window_status = _classify_window(event_date, min_days_out, max_days_out)
     if window_status in ("expired", "too_far_out", "too_soon"):
         return None
 
     pay = jsonld.get("price", "") or ("Compensation mentioned" if scraped.get("mentions_payment") else "")
     contact = _extract_contact_signals(scraped, url)
+    location = jsonld.get("location_name") or scraped.get("location", "")
 
     return {
         "name": scraped.get("title") or _domain_of(url),
@@ -1116,7 +1221,7 @@ def _process_event_url(item: tuple) -> Optional[dict]:
         "found_at": _domain_of(url),
         "cfp_status": "Open — Call for Speakers" if scraped.get("has_cfp") else "Unknown",
         "description": scraped.get("description", ""),
-        "location": jsonld.get("location_name") or scraped.get("location", ""),
+        "location": location,
         "event_date": event_date.isoformat() if event_date else "",
         "event_date_raw": jsonld.get("start_date") or scraped.get("event_date_raw", ""),
         "date_confidence": date_confidence,
@@ -1132,25 +1237,56 @@ def _process_event_url(item: tuple) -> Optional[dict]:
         # signal exists for this lane the way 10times' own `type` field
         # gives us one, so this is an inference, not verified data.
         "event_type": "Conference",
+        "event_format": _infer_event_format(location, jsonld.get("attendance_mode", "")),
         "venue_name": "",
         "promoter_name": "",
         "promoter_website": "",
     }
 
 
-def run_cfp_discovery(keywords: list[str], max_results: int = HARD_MAX_RESULTS) -> dict:
+def _matches_exclusion(result: dict, exclusions: list[str]) -> bool:
+    """True if any exclusion term appears (case-insensitive) in the result's
+    name, description, promoter, or domain."""
+    haystack = " ".join([
+        result.get("name", ""),
+        result.get("description", ""),
+        result.get("promoter_name", ""),
+        result.get("found_at", ""),
+    ]).lower()
+    return any(term.lower() in haystack for term in exclusions if term.strip())
+
+
+def run_cfp_discovery(
+    keywords: list[str],
+    max_results: int = HARD_MAX_RESULTS,
+    geography: str = "",
+    country_code: str = "WW",
+    min_days_out: int = _DEFAULT_MIN_DAYS_OUT,
+    max_days_out: int = _DEFAULT_MAX_DAYS_OUT,
+    event_formats: Optional[list[str]] = None,
+    exclusions: Optional[list[str]] = None,
+) -> dict:
     """Search + lightly scrape for active conferences/CFPs matching keywords.
 
-    Filters out CFPs detected as closed and events outside the 6-12 month
-    active window (expired, too soon, or more than a year out). Events with
-    no confidently-parsed date are kept (window_status='unknown') rather than
-    silently dropped, since date extraction is best-effort.
+    Filters out CFPs detected as closed and events outside the active date
+    window (expired, too soon, or beyond max_days_out — defaults to 6-12
+    months out). Events with no confidently-parsed date are kept
+    (window_status='unknown') rather than silently dropped, since date
+    extraction is best-effort. `event_formats`, if given, filters similarly
+    without dropping results whose format couldn't be inferred. `exclusions`
+    drops any result whose name/description/promoter/domain matches a term.
+
+    This is Phase 1 (discovery) only — profile fields (geography, date
+    window, formats, exclusions) shape which candidates get found and kept,
+    but nothing here scores, ranks, or weights results against the profile.
 
     Hard-capped at HARD_MAX_RESULTS regardless of the requested max_results.
     Read-only: no database writes of any kind happen here.
     """
     max_results = max(1, min(int(max_results or HARD_MAX_RESULTS), HARD_MAX_RESULTS))
-    queries = _build_queries(keywords)
+    event_formats = [f.strip().lower() for f in (event_formats or []) if f and f.strip()]
+    exclusions = [e for e in (exclusions or []) if e and e.strip()]
+    queries = _build_queries(keywords, geography=geography)
     logger.info(f"[CFP-SCOUT] Running {len(queries)} queries for keywords={keywords}")
 
     # The three discovery lanes are fully independent — they used to run
@@ -1159,10 +1295,16 @@ def run_cfp_discovery(keywords: list[str], max_results: int = HARD_MAX_RESULTS) 
     # minutes — then Confs.tech), so total time was the SUM of all three.
     # Running them concurrently makes it the MAX of the three instead, which
     # is the single biggest lever on wall-clock time for a scout run.
+    search_directories_bound = partial(
+        _search_directories, country=country_code, min_days_out=min_days_out, max_days_out=max_days_out,
+    )
+    search_confs_tech_bound = partial(
+        _search_confs_tech, min_days_out=min_days_out, max_days_out=max_days_out,
+    )
     with ThreadPoolExecutor(max_workers=3) as discovery_executor:
         web_search_future = discovery_executor.submit(web_search, queries, results_per_query=15, delay=0.8)
-        directories_future = discovery_executor.submit(_search_directories, keywords, max_results)
-        confs_tech_future = discovery_executor.submit(_search_confs_tech, keywords)
+        directories_future = discovery_executor.submit(search_directories_bound, keywords, max_results)
+        confs_tech_future = discovery_executor.submit(search_confs_tech_bound, keywords)
 
         url_sources = web_search_future.result()
         directory_items = directories_future.result()
@@ -1179,9 +1321,15 @@ def run_cfp_discovery(keywords: list[str], max_results: int = HARD_MAX_RESULTS) 
     raw_results: list[dict] = list(confs_tech_results)
     lock = threading.Lock()
 
+    process_event_url_bound = partial(_process_event_url, min_days_out=min_days_out, max_days_out=max_days_out)
+    process_directory_item_bound = partial(
+        _process_directory_item, min_days_out=min_days_out, max_days_out=max_days_out,
+    )
     with ThreadPoolExecutor(max_workers=_SCRAPE_WORKERS) as executor:
-        futures = {executor.submit(_process_event_url, item): item for item in event_candidates}
-        futures.update({executor.submit(_process_directory_item, item): item for item in directory_items})
+        futures = {executor.submit(process_event_url_bound, item): item for item in event_candidates}
+        futures.update(
+            {executor.submit(process_directory_item_bound, item): item for item in directory_items}
+        )
         for future in as_completed(futures):
             try:
                 res = future.result()
@@ -1191,6 +1339,14 @@ def run_cfp_discovery(keywords: list[str], max_results: int = HARD_MAX_RESULTS) 
             if res:
                 with lock:
                     raw_results.append(res)
+
+    if event_formats:
+        raw_results = [
+            r for r in raw_results
+            if r.get("event_format") in ("unknown", "") or r.get("event_format") in event_formats
+        ]
+    if exclusions:
+        raw_results = [r for r in raw_results if not _matches_exclusion(r, exclusions)]
 
     deduped = _dedupe_by_domain(raw_results)
     final = deduped[:max_results]

@@ -1,10 +1,23 @@
 # CFP Conference Scout
 
-Standalone keyword-driven discovery tool for conferences/tradeshows with an
-open call for speakers. Searches the web, an Apify-backed event directory
-(10times), and the free Confs.tech dataset; filters to active opportunities
-(6–12 months out, CFP not closed); and surfaces contact info, submission
+Standalone discovery tool for conferences/tradeshows with an open call for
+speakers. Searches the web, an Apify-backed event directory (10times), and
+the free Confs.tech dataset; filters to active opportunities (6–12 months
+out by default, CFP not closed); and surfaces contact info, submission
 links, and promoter/venue data where available.
+
+Discovery queries rotate through the full event-type vocabulary
+(conference, convention, summit, symposium, congress, forum, annual
+meeting, workshop, expo) instead of only ever searching for "conference".
+
+Beyond plain keywords, an optional speaker profile (primary/secondary
+niches, speaking topics, expertise keywords, audiences, geography, date
+window, event formats, exclusions) can shape discovery — click "Advanced:
+speaker profile" in the UI, or pass a `profile` object to
+`POST /api/cfp-scout/run` (see `CfpProfile` in `backend/app.py`). This is
+Phase 1 (discovery) only: profile fields widen or narrow which candidates
+get found and kept — nothing scores, ranks, or weights results against the
+profile.
 
 Extracted from a larger internal monorepo into a fully standalone project —
 zero dependency on any other repo. Read-only: nothing here writes to a

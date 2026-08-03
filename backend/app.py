@@ -20,6 +20,7 @@ import os
 import threading
 import time
 import uuid
+from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -28,7 +29,12 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-from cfp_scout import HARD_MAX_RESULTS, run_cfp_discovery
+from cfp_scout import (
+    HARD_MAX_RESULTS,
+    _DEFAULT_MAX_DAYS_OUT,
+    _DEFAULT_MIN_DAYS_OUT,
+    run_cfp_discovery,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -65,9 +71,52 @@ _jobs_lock = threading.Lock()
 _JOB_TTL_SECONDS = 30 * 60
 
 
+# Phase 1 (discovery) profile — see cfp_scout.run_cfp_discovery's docstring.
+# Deliberately no scoring/weighting fields: niches/topics/expertise/audiences
+# all flatten into a flat search-term list, on equal footing, per explicit
+# instruction to skip matching/ranking for this phase.
+class CfpProfile(BaseModel):
+    primary_niche: str = ""
+    secondary_niches: list[str] = Field(default_factory=list)
+    speaking_topics: list[str] = Field(default_factory=list)
+    expertise_keywords: list[str] = Field(default_factory=list)
+    audiences: list[str] = Field(default_factory=list)
+    geography: str = ""
+    # Raw 10times country code (e.g. "US", "GB"), not a free-text place name
+    # — "WW" (worldwide) is the actor's own default.
+    country_code: str = "WW"
+    min_days_out: int = _DEFAULT_MIN_DAYS_OUT
+    max_days_out: int = _DEFAULT_MAX_DAYS_OUT
+    event_formats: list[str] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+
+
 class CfpScoutRunRequest(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     max_results: int = HARD_MAX_RESULTS
+    profile: Optional[CfpProfile] = None
+
+
+def _flatten_profile_keywords(base_keywords: list[str], profile: Optional[CfpProfile]) -> list[str]:
+    """Merge profile niches/topics/expertise/audiences into one flat keyword
+    list, alongside any plain keywords — no weighting between them."""
+    terms = list(base_keywords)
+    if profile:
+        if profile.primary_niche:
+            terms.append(profile.primary_niche)
+        terms.extend(profile.secondary_niches)
+        terms.extend(profile.speaking_topics)
+        terms.extend(profile.expertise_keywords)
+        terms.extend(profile.audiences)
+
+    seen: set = set()
+    deduped: list[str] = []
+    for term in terms:
+        term = term.strip()
+        if term and term.lower() not in seen:
+            seen.add(term.lower())
+            deduped.append(term)
+    return deduped
 
 
 def _prune_expired_jobs() -> None:
@@ -77,9 +126,19 @@ def _prune_expired_jobs() -> None:
         _jobs.pop(job_id, None)
 
 
-def _run_job(job_id: str, keywords: list[str], max_results: int) -> None:
+def _run_job(job_id: str, keywords: list[str], max_results: int, profile: Optional[CfpProfile]) -> None:
     try:
-        outcome = run_cfp_discovery(keywords=keywords, max_results=max_results)
+        kwargs = {}
+        if profile:
+            kwargs = dict(
+                geography=profile.geography,
+                country_code=profile.country_code or "WW",
+                min_days_out=profile.min_days_out,
+                max_days_out=profile.max_days_out,
+                event_formats=profile.event_formats,
+                exclusions=profile.exclusions,
+            )
+        outcome = run_cfp_discovery(keywords=keywords, max_results=max_results, **kwargs)
         with _jobs_lock:
             _jobs[job_id].update(status="completed", **outcome)
     except Exception as exc:
@@ -95,7 +154,7 @@ def health():
 
 @app.post("/api/cfp-scout/run")
 def start_cfp_scout(payload: CfpScoutRunRequest, _: None = Depends(verify_api_key)):
-    keywords = [k.strip() for k in payload.keywords if k and k.strip()][:8]
+    keywords = _flatten_profile_keywords(payload.keywords, payload.profile)[:8]
     if not keywords:
         raise HTTPException(status_code=400, detail="At least one keyword is required")
     max_results = max(1, min(payload.max_results or HARD_MAX_RESULTS, HARD_MAX_RESULTS))
@@ -113,7 +172,9 @@ def start_cfp_scout(payload: CfpScoutRunRequest, _: None = Depends(verify_api_ke
             "urls_found": 0,
         }
 
-    thread = threading.Thread(target=_run_job, args=(job_id, keywords, max_results), daemon=True)
+    thread = threading.Thread(
+        target=_run_job, args=(job_id, keywords, max_results, payload.profile), daemon=True
+    )
     thread.start()
 
     logger.info(f"[CFP-SCOUT] Started run {job_id} keywords={keywords} max_results={max_results}")
