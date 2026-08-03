@@ -719,11 +719,14 @@ def _process_directory_item(item: dict) -> Optional[dict]:
         "window_status": window_status,
         "pay": "Compensation mentioned" if (scraped and scraped.get("mentions_payment")) else "",
         "contact_email": contact["contact_email"],
+        "contact_name": "",
+        "contact_source": contact["contact_source"],
         "submission_form_url": contact["submission_form_url"],
         "event_type": item.get("event_type", ""),
         "venue_name": item.get("venue_name", ""),
         "promoter_name": item.get("promoter_name", ""),
         "promoter_website": item.get("promoter_website", ""),
+        "_full_text": contact["_full_text"],
     }
 
 
@@ -811,9 +814,14 @@ def _process_confs_tech_entry(entry: dict, topic: str) -> Optional[dict]:
         "window_status": window_status,
         "pay": "",
         "contact_email": "",
+        "contact_name": "",
+        "contact_source": "",
         # Confs.tech's own cfpUrl field is literally the submission page —
         # no scraping needed, it's already structured data.
         "submission_form_url": entry.get("cfpUrl", ""),
+        # No page is scraped for this lane, so there's no text for the AI
+        # enrichment stage to work with — it'll correctly skip these.
+        "_full_text": "",
         # Confs.tech is conference listings only — no tradeshow distinction
         # and no organizer/venue data in its schema.
         "event_type": "Conference",
@@ -860,18 +868,75 @@ _SUBMISSION_FORM_KEYWORDS = (
     "submittable.com", "papercall.io", "sessionize.com",
 )
 
+# Contact-info waterfall, cheapest/free first:
+#   1. Emails already in the page's visible text (existing)
+#   2. mailto: links — a real gap before this: a link like
+#      <a href="mailto:speakers@x.com">Contact Us</a> has no email in its
+#      visible text at all, so stage 1 alone silently missed it.
+#   3. One likely contact/about page on the same domain, re-running 1+2 on it
+#   4. AI extraction (see _ai_extract_contact) — last resort, capped, and
+#      only ever run on the final result set, not every raw candidate.
+
+_MAILTO_RE = re.compile(r"^mailto:([^?]+)", re.I)
+_EMAIL_FORMAT_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+_CONTACT_PAGE_KEYWORDS = ("contact", "about", "team", "speakers")
+
+
+def _extract_mailto_email(raw_links: list[str]) -> str:
+    for href in raw_links or []:
+        m = _MAILTO_RE.match(href.strip())
+        if not m:
+            continue
+        candidate = m.group(1).strip()
+        if _EMAIL_FORMAT_RE.match(candidate):
+            return candidate
+    return ""
+
+
+def _emails_from_scrape(scraped: Optional[dict]) -> str:
+    """Stages 1+2 of the waterfall against one already-scraped page."""
+    if not scraped:
+        return ""
+    emails = scraped.get("emails") or []
+    if emails:
+        return emails[0]
+    return _extract_mailto_email(scraped.get("raw_links") or [])
+
+
+def _find_contact_page_url(base_url: str, raw_links: list[str]) -> str:
+    """Best candidate contact/about/team page, or '' if none look promising."""
+    best_rank = None
+    best_href = ""
+    for href in raw_links or []:
+        href_lower = href.lower()
+        for rank, kw in enumerate(_CONTACT_PAGE_KEYWORDS):
+            if kw in href_lower and (best_rank is None or rank < best_rank):
+                best_rank, best_href = rank, href
+                break
+    return urljoin(base_url, best_href) if best_href else ""
+
 
 def _extract_contact_signals(scraped: Optional[dict], page_url: str) -> dict:
     """Best-effort contact email + speaker-submission-form URL from a scrape.
 
-    Returns {} fields empty (not missing) when nothing is found — never
-    guesses or invents a value.
+    Fields are empty (not missing) when nothing is found — never guesses or
+    invents a value. Also returns _full_text: an internal scratch field for
+    the later AI-enrichment stage, stripped before results are returned from
+    run_cfp_discovery().
     """
     if not scraped:
-        return {"contact_email": "", "submission_form_url": ""}
+        return {"contact_email": "", "contact_source": "", "submission_form_url": "", "_full_text": ""}
 
-    emails = scraped.get("emails") or []
-    contact_email = emails[0] if emails else ""
+    contact_email = _emails_from_scrape(scraped)
+    contact_source = "scraped" if contact_email else ""
+
+    if not contact_email:
+        contact_page_url = _find_contact_page_url(page_url, scraped.get("raw_links") or [])
+        if contact_page_url and contact_page_url != page_url:
+            contact_scraped = scrape_page(contact_page_url)
+            contact_email = _emails_from_scrape(contact_scraped)
+            if contact_email:
+                contact_source = "scraped"
 
     submission_form_url = ""
     for href in scraped.get("raw_links") or []:
@@ -884,7 +949,104 @@ def _extract_contact_signals(scraped: Optional[dict], page_url: str) -> dict:
         # on the page — better than nothing.
         submission_form_url = urljoin(page_url, scraped["guest_form_url"])
 
-    return {"contact_email": contact_email, "submission_form_url": submission_form_url}
+    return {
+        "contact_email": contact_email,
+        "contact_source": contact_source,
+        "submission_form_url": submission_form_url,
+        "_full_text": scraped.get("full_text", ""),
+    }
+
+
+# ── AI-assisted contact extraction (Claude, last resort, capped) ────────────
+# Only ever called on the FINAL result set (post-dedup, post-window-filter —
+# see _enrich_missing_contacts), never on the raw candidate pool, and only
+# for results the free waterfall stages above already failed on. Bounded by
+# CFP_AI_ENRICHMENT_MAX_CALLS so cost stays predictable regardless of how
+# many results come back, same spirit as the Apify $ cap.
+
+_AI_CONTACT_PROMPT = """You are extracting contact information from scraped text of a conference/event web page. Find a real, specific contact email address, or a named contact person (e.g. "program chair", "speaker coordinator"), for who to reach out to about speaking at this event.
+
+Rules:
+- Only report information that is ACTUALLY present in the text below, quoted exactly as written. Never invent, guess, or construct an email address or name.
+- If no real contact email or named contact person is present, say NONE for that field.
+
+Page text:
+\"\"\"
+{text}
+\"\"\"
+
+Respond in exactly this format, nothing else:
+EMAIL: <email or NONE>
+CONTACT_NAME: <name or NONE>"""
+
+_AI_MODEL = "claude-haiku-4-5"
+
+
+def _ai_extract_contact(full_text: str, api_key: str) -> dict:
+    """Best-effort contact extraction via Claude. Returns {} on failure or nothing found."""
+    if not full_text or not api_key:
+        return {}
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=_AI_MODEL,
+            max_tokens=100,
+            messages=[{"role": "user", "content": _AI_CONTACT_PROMPT.format(text=full_text[:2000])}],
+        )
+        raw = response.content[0].text.strip()
+        email, name = "", ""
+        for line in raw.splitlines():
+            if line.upper().startswith("EMAIL:"):
+                val = line.split(":", 1)[1].strip()
+                if val and val.upper() != "NONE":
+                    email = val
+            elif line.upper().startswith("CONTACT_NAME:"):
+                val = line.split(":", 1)[1].strip()
+                if val and val.upper() != "NONE":
+                    name = val
+        # Anti-hallucination guard: an extracted email must actually appear
+        # verbatim in the source text, not just look well-formed. The prompt
+        # instructs this already — this is a hard check on top of it.
+        if email and (not _EMAIL_FORMAT_RE.match(email) or email.lower() not in full_text.lower()):
+            logger.warning(f"[CFP-SCOUT] AI returned an email not present in source text — discarding: {email}")
+            email = ""
+        return {"contact_email": email, "contact_name": name}
+    except Exception as exc:
+        logger.warning(f"[CFP-SCOUT] AI contact extraction failed: {exc}")
+        return {}
+
+
+def _enrich_missing_contacts(results: list[dict]) -> list[dict]:
+    """Run the AI stage on final results still missing a contact email.
+
+    No-op if CLAUDE_API_KEY isn't set, or CFP_AI_ENRICHMENT_MAX_CALLS is 0.
+    """
+    api_key = os.getenv("CLAUDE_API_KEY", "") or os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return results
+    max_calls = max(0, int(os.getenv("CFP_AI_ENRICHMENT_MAX_CALLS", "20")))
+    if max_calls == 0:
+        return results
+
+    candidates = [r for r in results if not r.get("contact_email") and r.get("_full_text")][:max_calls]
+    if not candidates:
+        return results
+
+    def _enrich_one(r: dict) -> None:
+        ai_result = _ai_extract_contact(r["_full_text"], api_key)
+        if ai_result.get("contact_email"):
+            r["contact_email"] = ai_result["contact_email"]
+            r["contact_source"] = "ai"
+        if ai_result.get("contact_name"):
+            r["contact_name"] = ai_result["contact_name"]
+            r.setdefault("contact_source", "ai")
+
+    with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as executor:
+        list(executor.map(_enrich_one, candidates))
+
+    logger.info(f"[CFP-SCOUT] AI contact enrichment: {len(candidates)} call(s) made")
+    return results
 
 
 # ── Shared helpers ───────────────────────────────────────────────────────────
@@ -961,7 +1123,10 @@ def _process_event_url(item: tuple) -> Optional[dict]:
         "window_status": window_status,
         "pay": pay,
         "contact_email": contact["contact_email"],
+        "contact_name": "",
+        "contact_source": contact["contact_source"],
         "submission_form_url": contact["submission_form_url"],
+        "_full_text": contact["_full_text"],
         # Our search queries are all conference-flavored ("call for
         # speakers" conference, etc.) — no reliable Tradeshow/Workshop
         # signal exists for this lane the way 10times' own `type` field
@@ -1029,6 +1194,16 @@ def run_cfp_discovery(keywords: list[str], max_results: int = HARD_MAX_RESULTS) 
 
     deduped = _dedupe_by_domain(raw_results)
     final = deduped[:max_results]
+
+    # AI enrichment is a last resort, run only here — on the final result
+    # set, after dedup and truncation — never on the raw candidate pool.
+    # No-op if CLAUDE_API_KEY isn't set.
+    final = _enrich_missing_contacts(final)
+
+    # _full_text was internal scratch data for the AI stage above; never
+    # meant to reach the API response.
+    for r in final:
+        r.pop("_full_text", None)
 
     return {
         "query_count": len(queries),

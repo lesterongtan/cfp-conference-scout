@@ -10,6 +10,13 @@ Extracted from a larger internal monorepo into a fully standalone project —
 zero dependency on any other repo. Read-only: nothing here writes to a
 database.
 
+Contact info goes through a waterfall, cheapest/free first: page text →
+`mailto:` links → one contact/about page on the same domain → (optional,
+last resort, capped) AI extraction via Claude. The AI stage only ever runs
+on the final result set, never the raw candidate pool, and never invents a
+value — an AI-reported email is discarded unless it's verified to actually
+appear verbatim in the scraped source text.
+
 ## Structure
 
 - `backend/` — FastAPI app (`app.py`), the discovery pipeline (`cfp_scout.py`),
@@ -77,3 +84,6 @@ endpoints.
 - Category→keyword mapping for the directories lane is best-effort, not
   Apify-verified — extend `_TENTIMES_CATEGORY_BY_KEYWORD` in `cfp_scout.py`
   as gaps surface.
+- AI contact enrichment is capped at 20 calls per run by default
+  (`CFP_AI_ENRICHMENT_MAX_CALLS`), and only runs at all if `CLAUDE_API_KEY`
+  is set — leave it unset to disable entirely, no cost either way.
