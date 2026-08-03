@@ -38,6 +38,27 @@ npm run dev
 
 Then open http://localhost:3000.
 
+## Deploying to Railway
+
+This is a monorepo with two different runtimes, so it needs **two separate
+Railway services** pointing at this same repo:
+
+1. Create a new Railway project, add a service from this GitHub repo.
+2. In that service's Settings → **Root Directory**, set it to `backend`.
+   Railway will pick up `backend/railway.toml` and run
+   `uvicorn app:app --host 0.0.0.0 --port $PORT` automatically.
+3. Add the backend env vars (see `backend/.env.example`) in that service's
+   Variables tab — `API_KEY` at minimum.
+4. Add a second service from the same repo, set its **Root Directory** to
+   `frontend`. It picks up `frontend/railway.toml` (`npm run build` then
+   `npm run start -- -p $PORT`).
+5. Add the frontend env vars: `API_KEY` (same value as the backend) and
+   `API_BASE_URL` set to the backend service's Railway-assigned URL
+   (Railway → backend service → Settings → Networking → public domain).
+
+Both services build with Nixpacks auto-detection (Python for `backend/`,
+Node for `frontend/`) — no Dockerfile needed.
+
 ## Configuration
 
 See `backend/.env.example` for all options. Nothing is required to run —
