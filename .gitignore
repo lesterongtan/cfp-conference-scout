@@ -1,0 +1,22 @@
+# Env files — never commit real secrets
+.env
+.env.local
+!.env.example
+
+# Backend
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/.venv/
+backend/venv/
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/next-env.d.ts
+frontend/tsconfig.tsbuildinfo
+frontend/npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
