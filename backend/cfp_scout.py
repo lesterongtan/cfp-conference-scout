@@ -620,24 +620,32 @@ def _search_directories(keywords: list[str], max_results: int = HARD_MAX_RESULTS
     # both slower and ~2-3x pricier per Apify's own log output.
     max_items = max(10, max_results)
 
-    results: list[dict] = []
+    # Build every keyword's input up front. _build_directory_input only
+    # returns None when the actor is unverified AND no input template is
+    # configured — a condition that doesn't depend on the keyword at all, so
+    # if it fails once it fails for all of them. Check once instead of
+    # rediscovering that on every loop iteration.
+    keyword_inputs: list[tuple[str, dict]] = []
     for kw in run_keywords:
         run_input = _build_directory_input(actor_id, kw, max_items=max_items)
         if run_input is None:
-            return results
+            return []
+        keyword_inputs.append((kw, run_input))
+
+    def _run_one(kw_input: tuple[str, dict]) -> list[dict]:
+        kw, run_input = kw_input
         items = _run_apify_actor(actor_id, run_input, apify_token, max_total_charge_usd=per_run_charge_usd)
-        normalized_count = 0
+        normalized: list[dict] = []
         for item in items:
-            normalized = _normalize_directory_item(item)
-            if normalized:
-                normalized_count += 1
-                results.append(normalized)
+            n = _normalize_directory_item(item)
+            if n:
+                normalized.append(n)
         logger.info(
             f"[CFP-SCOUT] Directories lane: '{kw}' -> {len(items)} raw items, "
-            f"{normalized_count} normalized (capped at ${per_run_charge_usd:.2f}/run, "
+            f"{len(normalized)} normalized (capped at ${per_run_charge_usd:.2f}/run, "
             f"${max_charge_usd:.2f} total across all keywords)"
         )
-        if items and normalized_count == 0:
+        if items and not normalized:
             # Every raw item failed to normalize — almost certainly a field-name
             # mismatch against the actor's real (vs. documented) output shape.
             # Log the first item's top-level keys so this is diagnosable from
@@ -646,6 +654,14 @@ def _search_directories(keywords: list[str], max_results: int = HARD_MAX_RESULTS
                 f"[CFP-SCOUT] Directories lane: got {len(items)} raw items for '{kw}' but "
                 f"none normalized — first item's keys: {sorted(items[0].keys())}"
             )
+        return normalized
+
+    # Each keyword hits Apify independently — running them one at a time was
+    # pure wasted wall-clock time (up to 3x the actual work for no reason).
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max(1, len(keyword_inputs))) as executor:
+        for normalized in executor.map(_run_one, keyword_inputs):
+            results.extend(normalized)
 
     return results
 
@@ -972,7 +988,21 @@ def run_cfp_discovery(keywords: list[str], max_results: int = HARD_MAX_RESULTS) 
     queries = _build_queries(keywords)
     logger.info(f"[CFP-SCOUT] Running {len(queries)} queries for keywords={keywords}")
 
-    url_sources = web_search(queries, results_per_query=15, delay=0.8)
+    # The three discovery lanes are fully independent — they used to run
+    # strictly sequentially (web search, then wait for the directories lane's
+    # Apify run to fully poll to completion — anywhere from 45s to several
+    # minutes — then Confs.tech), so total time was the SUM of all three.
+    # Running them concurrently makes it the MAX of the three instead, which
+    # is the single biggest lever on wall-clock time for a scout run.
+    with ThreadPoolExecutor(max_workers=3) as discovery_executor:
+        web_search_future = discovery_executor.submit(web_search, queries, results_per_query=15, delay=0.8)
+        directories_future = discovery_executor.submit(_search_directories, keywords, max_results)
+        confs_tech_future = discovery_executor.submit(_search_confs_tech, keywords)
+
+        url_sources = web_search_future.result()
+        directory_items = directories_future.result()
+        confs_tech_results = confs_tech_future.result()  # already fully processed, no scrape needed
+
     logger.info(f"[CFP-SCOUT] {len(url_sources)} unique URLs discovered")
 
     # Scrape a bounded candidate pool — more than max_results since the date/
@@ -980,8 +1010,6 @@ def run_cfp_discovery(keywords: list[str], max_results: int = HARD_MAX_RESULTS) 
     # Interleaved by backend first so an early, high-volume backend (e.g.
     # Tavily) can't crowd out a later one (e.g. Exa) before the cap hits.
     event_candidates = _interleave_by_source(url_sources)[: max_results * 2]
-    directory_items = _search_directories(keywords, max_results=max_results)
-    confs_tech_results = _search_confs_tech(keywords)  # already fully processed, no scrape needed
 
     raw_results: list[dict] = list(confs_tech_results)
     lock = threading.Lock()
