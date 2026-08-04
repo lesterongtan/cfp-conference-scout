@@ -285,12 +285,79 @@ def _flatten_jsonld(data) -> list[dict]:
     return []
 
 
+def _jsonld_address_text(location) -> str:
+    """City/region text from a schema.org Place's address, if present."""
+    if not isinstance(location, dict):
+        return ""
+    address = location.get("address")
+    if isinstance(address, dict):
+        parts = [
+            address.get("addressLocality", ""),
+            address.get("addressRegion", "") or address.get("addressCountry", ""),
+        ]
+        return ", ".join(p for p in parts if p)
+    if isinstance(address, str):
+        return address
+    return ""
+
+
 def _jsonld_location_name(location) -> str:
+    """City/region text for display — prefers structured address over the
+    venue's own name (see _jsonld_venue_name for that), since a venue name
+    like "Austin Convention Center" isn't itself a location a user can
+    filter/search geography by."""
     if isinstance(location, dict):
-        return location.get("name", "") or location.get("address", "") or ""
+        return _jsonld_address_text(location) or location.get("name", "") or ""
     if isinstance(location, str):
         return location
     return ""
+
+
+def _jsonld_venue_name(location) -> str:
+    if not isinstance(location, dict):
+        return ""
+    loc_type = location.get("@type", "")
+    loc_type = " ".join(loc_type) if isinstance(loc_type, list) else str(loc_type)
+    if "virtual" in loc_type.lower():
+        return ""
+    return location.get("name", "") or ""
+
+
+def _jsonld_organizer_name(organizer) -> str:
+    for org in (organizer if isinstance(organizer, list) else [organizer]):
+        if isinstance(org, dict) and org.get("name"):
+            return org["name"]
+        if isinstance(org, str) and org.strip():
+            return org.strip()
+    return ""
+
+
+def _jsonld_organizer_url(organizer) -> str:
+    for org in (organizer if isinstance(organizer, list) else [organizer]):
+        if isinstance(org, dict) and org.get("url"):
+            return org["url"]
+    return ""
+
+
+# Fallback for pages with no schema.org organizer — a plain-text pattern
+# match, not verified structured data. Only used when JSON-LD gives us
+# nothing, same spirit as the AI contact stage: best-effort, never invented.
+# Tokens require a mandatory space between them and no embedded punctuation,
+# so the match naturally stops at the first lowercase word or punctuation —
+# e.g. "Organized by Acme Events LLC every year" stops at "every", and
+# "Organized by Acme Events LLC. Program Chair: ..." stops at "LLC" rather
+# than running on into the next sentence.
+_ORGANIZER_TEXT_RE = re.compile(
+    r"(?:[Oo]rganized|[Pp]roduced|[Pp]resented|[Hh]osted)\s+by\s+"
+    r"([A-Z][\w&'-]*(?:\s+[A-Z][\w&'-]*){0,5})"
+)
+
+
+def _extract_organizer_from_text(full_text: str) -> str:
+    if not full_text:
+        return ""
+    m = _ORGANIZER_TEXT_RE.search(full_text)
+    return m.group(1).strip() if m else ""
 
 
 def _jsonld_price(offers) -> str:
@@ -328,11 +395,16 @@ def _fetch_jsonld_event(url: str, timeout: int = 8) -> dict:
                 types = types if isinstance(types, list) else [types]
                 if not any(str(t).lower() == "event" for t in types if t):
                     continue
+                location = obj.get("location")
+                organizer = obj.get("organizer")
                 return {
                     "start_date": obj.get("startDate", ""),
-                    "location_name": _jsonld_location_name(obj.get("location")),
+                    "location_name": _jsonld_location_name(location),
+                    "venue_name": _jsonld_venue_name(location),
                     "price": _jsonld_price(obj.get("offers")),
                     "attendance_mode": obj.get("eventAttendanceMode", "") or "",
+                    "organizer_name": _jsonld_organizer_name(organizer),
+                    "organizer_url": _jsonld_organizer_url(organizer),
                 }
     except Exception as exc:
         logger.debug(f"[CFP-SCOUT] JSON-LD parse failed for {url}: {exc}")
@@ -808,13 +880,16 @@ def _process_directory_item(
         "window_status": window_status,
         "pay": "Compensation mentioned" if (scraped and scraped.get("mentions_payment")) else "",
         "contact_email": contact["contact_email"],
-        "contact_name": "",
+        "contact_name": contact["contact_name"],
+        "contact_role": contact.get("contact_role", ""),
         "contact_source": contact["contact_source"],
         "submission_form_url": contact["submission_form_url"],
         "event_type": item.get("event_type", ""),
         "event_format": _infer_event_format(location),
         "venue_name": item.get("venue_name", ""),
-        "promoter_name": item.get("promoter_name", ""),
+        # 10times already gives us a verified promoter (organizer.name) —
+        # only fall back to the text-pattern guess for actors that don't.
+        "promoter_name": item.get("promoter_name") or _extract_organizer_from_text(full_text),
         "promoter_website": item.get("promoter_website", ""),
         "_full_text": contact["_full_text"],
     }
@@ -910,6 +985,7 @@ def _process_confs_tech_entry(
         "pay": "",
         "contact_email": "",
         "contact_name": "",
+        "contact_role": "",
         "contact_source": "",
         # Confs.tech's own cfpUrl field is literally the submission page —
         # no scraping needed, it's already structured data.
@@ -1003,6 +1079,95 @@ def _emails_from_scrape(scraped: Optional[dict]) -> str:
     return _extract_mailto_email(scraped.get("raw_links") or [])
 
 
+# ── Coordinator name/role — free-stage best-effort, not just an email ───────
+# Previously contact_name was only ever set by the paid AI stage; these are
+# the same free signals already being scraped, just not read for a name.
+
+_GENERIC_LINK_TEXT = {
+    "email", "email us", "contact", "contact us", "here", "click here",
+    "info", "send email", "mail", "write to us", "get in touch", "contact me",
+}
+
+# Real names essentially never start with an imperative verb — this catches
+# CTA-style mailto anchor text ("Submit Request", "Email Now", "Get In
+# Touch") that the word-count/capitalization check alone lets through,
+# since CTAs are often capitalized multi-word phrases too. Confirmed live:
+# "Submit Request" on papercall.io passed the old heuristic.
+_CTA_FIRST_WORDS = {
+    "submit", "contact", "email", "click", "apply", "request", "get",
+    "join", "register", "send", "learn", "view", "see", "read", "book",
+    "buy", "sign", "download", "subscribe", "reserve", "ask", "reach",
+    "write", "say", "drop", "message", "ping", "talk", "connect",
+    "follow", "visit", "start", "try", "shop", "order", "call", "chat",
+    "find", "explore", "discover", "watch", "listen", "share",
+}
+
+
+def _looks_like_person_name(text: str) -> bool:
+    text = (text or "").strip()
+    if not text or "@" in text or len(text) > 60:
+        return False
+    if text.lower() in _GENERIC_LINK_TEXT:
+        return False
+    words = text.split()
+    if not (2 <= len(words) <= 4):
+        return False
+    if words[0].lower() in _CTA_FIRST_WORDS:
+        return False
+    return all(w[0].isupper() for w in words if w[:1].isalpha())
+
+
+# Best-effort plain-text pattern for "Program Chair: Jane Doe" style
+# credits — not verified structured data, same spirit as
+# _extract_organizer_from_text.
+_COORDINATOR_ROLE_TERMS = (
+    "program committee chair", "speaker coordinator", "conference coordinator",
+    "event coordinator", "program chair", "speaker chair", "cfp chair",
+    "content chair", "program director",
+)
+_NAME_AFTER_ROLE_RE = re.compile(r"^\s*[:,\-–]?\s*([A-Z][\w.'-]*(?:\s+[A-Z][\w.'-]*){0,3})")
+
+
+def _extract_role_contact(full_text: str) -> tuple[str, str]:
+    """Best-effort (name, role) from patterns like 'Program Chair: Jane Doe'."""
+    if not full_text:
+        return "", ""
+    lowered = full_text.lower()
+    for term in _COORDINATOR_ROLE_TERMS:
+        idx = lowered.find(term)
+        if idx == -1:
+            continue
+        after = full_text[idx + len(term): idx + len(term) + 80]
+        m = _NAME_AFTER_ROLE_RE.match(after)
+        if m and _looks_like_person_name(m.group(1)):
+            return m.group(1).strip(), full_text[idx: idx + len(term)]
+    return "", ""
+
+
+def _resolve_contact_name(
+    original_scraped: Optional[dict],
+    contact_page_scraped: Optional[dict],
+    contact_email: str,
+) -> tuple[str, str]:
+    """Best-effort (name, role) for whichever email the waterfall already
+    found — never invents a name, only reads it from mailto anchor text or
+    a nearby role-title pattern already present in the scraped text."""
+    for source in (contact_page_scraped, original_scraped):
+        if not source:
+            continue
+        for contact in source.get("mailto_contacts") or []:
+            if contact.get("email", "").strip().lower() == (contact_email or "").strip().lower():
+                if _looks_like_person_name(contact.get("name", "")):
+                    return contact["name"].strip(), ""
+    for source in (original_scraped, contact_page_scraped):
+        if not source:
+            continue
+        name, role = _extract_role_contact(source.get("full_text", ""))
+        if name:
+            return name, role
+    return "", ""
+
+
 def _find_contact_page_url(base_url: str, raw_links: list[str]) -> str:
     """Best candidate contact/about/team page, or '' if none look promising."""
     best_rank = None
@@ -1025,18 +1190,24 @@ def _extract_contact_signals(scraped: Optional[dict], page_url: str) -> dict:
     run_cfp_discovery().
     """
     if not scraped:
-        return {"contact_email": "", "contact_source": "", "submission_form_url": "", "_full_text": ""}
+        return {
+            "contact_email": "", "contact_name": "", "contact_role": "",
+            "contact_source": "", "submission_form_url": "", "_full_text": "",
+        }
 
     contact_email = _emails_from_scrape(scraped)
     contact_source = "scraped" if contact_email else ""
+    contact_page_scraped: Optional[dict] = None
 
     if not contact_email:
         contact_page_url = _find_contact_page_url(page_url, scraped.get("raw_links") or [])
         if contact_page_url and contact_page_url != page_url:
-            contact_scraped = scrape_page(contact_page_url)
-            contact_email = _emails_from_scrape(contact_scraped)
+            contact_page_scraped = scrape_page(contact_page_url)
+            contact_email = _emails_from_scrape(contact_page_scraped)
             if contact_email:
                 contact_source = "scraped"
+
+    contact_name, contact_role = _resolve_contact_name(scraped, contact_page_scraped, contact_email)
 
     submission_form_url = ""
     for href in scraped.get("raw_links") or []:
@@ -1051,6 +1222,8 @@ def _extract_contact_signals(scraped: Optional[dict], page_url: str) -> dict:
 
     return {
         "contact_email": contact_email,
+        "contact_name": contact_name,
+        "contact_role": contact_role,
         "contact_source": contact_source,
         "submission_form_url": submission_form_url,
         "_full_text": scraped.get("full_text", ""),
@@ -1212,6 +1385,7 @@ def _process_event_url(
     pay = jsonld.get("price", "") or ("Compensation mentioned" if scraped.get("mentions_payment") else "")
     contact = _extract_contact_signals(scraped, url)
     location = jsonld.get("location_name") or scraped.get("location", "")
+    promoter_name = jsonld.get("organizer_name", "") or _extract_organizer_from_text(scraped.get("full_text", ""))
 
     return {
         "name": scraped.get("title") or _domain_of(url),
@@ -1228,7 +1402,8 @@ def _process_event_url(
         "window_status": window_status,
         "pay": pay,
         "contact_email": contact["contact_email"],
-        "contact_name": "",
+        "contact_name": contact["contact_name"],
+        "contact_role": contact.get("contact_role", ""),
         "contact_source": contact["contact_source"],
         "submission_form_url": contact["submission_form_url"],
         "_full_text": contact["_full_text"],
@@ -1238,9 +1413,13 @@ def _process_event_url(
         # gives us one, so this is an inference, not verified data.
         "event_type": "Conference",
         "event_format": _infer_event_format(location, jsonld.get("attendance_mode", "")),
-        "venue_name": "",
-        "promoter_name": "",
-        "promoter_website": "",
+        "venue_name": jsonld.get("venue_name", ""),
+        "promoter_name": promoter_name,
+        # Only trust a promoter website from structured JSON-LD data — the
+        # text-pattern fallback only ever gives us a name, never a URL, and
+        # guessing one (e.g. from the event's own domain) would be wrong
+        # whenever the promoter runs multiple events under other domains.
+        "promoter_website": jsonld.get("organizer_url", ""),
     }
 
 

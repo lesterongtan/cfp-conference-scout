@@ -143,6 +143,18 @@ def _firecrawl_scrape(url: str, api_key: str, timeout: int = 20) -> Optional[dic
                 guest_form_url = link_url
                 break
 
+        # Anchor TEXT next to a mailto: link is often the contact's actual
+        # name (e.g. "[Jane Doe](mailto:jane@conf.com)") — markdown link
+        # syntax keeps text and url paired, unlike raw_links which only has
+        # the url. Kept separate from `emails` since not every mailto has a
+        # usable name attached.
+        mailto_contacts = []
+        for text, link_url in all_md_links:
+            if link_url.lower().startswith('mailto:'):
+                email_part = link_url[7:].split('?')[0].strip()
+                if email_part:
+                    mailto_contacts.append({'email': email_part, 'name': text.strip()})
+
         cfp_keywords = [
             'call for speakers', 'call for proposals', 'submit a talk',
             'speaker application', 'speaker submission', 'become a speaker',
@@ -170,6 +182,7 @@ def _firecrawl_scrape(url: str, api_key: str, timeout: int = 20) -> Optional[dic
             'guest_form_url': guest_form_url,
             'full_text': full_text_trimmed,
             'raw_links': raw_links[:50],
+            'mailto_contacts': mailto_contacts[:5],
             'scrape_backend': 'Firecrawl',
         }
     except Exception as e:
@@ -270,6 +283,7 @@ def scrape_page(url: str, timeout: int = 10) -> Optional[dict]:
         twitter_links = []
         guest_form_url = ''
         raw_links = []
+        mailto_contacts = []
         form_keywords = ['pitch', 'be-a-guest', 'be_a_guest', 'guest-form',
                          'guest_form', 'guest-application', 'typeform', 'calendly']
         for a_tag in soup.find_all('a', href=True):
@@ -282,6 +296,13 @@ def scrape_page(url: str, timeout: int = 10) -> Optional[dict]:
                 twitter_links.append(href)
             if not guest_form_url and any(kw in href.lower() for kw in form_keywords):
                 guest_form_url = href
+            # Anchor TEXT next to a mailto: link is often the contact's
+            # actual name — worth keeping alongside the address itself,
+            # since raw_links alone only has the href.
+            if href.lower().startswith('mailto:'):
+                email_part = href[7:].split('?')[0].strip()
+                if email_part:
+                    mailto_contacts.append({'email': email_part, 'name': a_tag.get_text(strip=True)})
         linkedin_links = list(set(linkedin_links))
         twitter_links = list(set(twitter_links))
 
@@ -321,6 +342,7 @@ def scrape_page(url: str, timeout: int = 10) -> Optional[dict]:
             'guest_form_url': guest_form_url,
             'full_text': full_text_trimmed,
             'raw_links': raw_links[:50],
+            'mailto_contacts': mailto_contacts[:5],
             'scrape_backend': 'BeautifulSoup',
         }
     except Exception as e:

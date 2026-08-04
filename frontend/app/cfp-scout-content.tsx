@@ -52,6 +52,7 @@ interface CfpResult {
   pay: string;
   contact_email: string;
   contact_name: string;
+  contact_role: string;
   contact_source: string;
   submission_form_url: string;
   event_type: string;
@@ -444,7 +445,7 @@ export function CfpScoutContent() {
                       Promoter
                     </TableHead>
                     <TableHead className="whitespace-normal">
-                      Contact
+                      Coordinator
                     </TableHead>
                     <TableHead className="whitespace-normal">Apply</TableHead>
                   </TableRow>
@@ -536,37 +537,47 @@ export function CfpScoutContent() {
                         )}
                       </TableCell>
                       <TableCell className="whitespace-normal break-words py-2">
-                        {r.contact_email ? (
-                          <div className="flex flex-wrap items-center gap-1">
-                            <a
-                              href={`mailto:${r.contact_email}`}
-                              className="text-primary hover:underline"
-                            >
-                              {r.contact_email}
-                            </a>
-                            {r.contact_source === "ai" && (
-                              <Badge
-                                variant="secondary"
-                                className="shrink-0 text-[10px]"
-                                title="Found via AI extraction, not a direct scrape"
-                              >
-                                AI
-                              </Badge>
+                        {r.contact_name || r.contact_email ? (
+                          <div className="space-y-0.5">
+                            {r.contact_name && (
+                              <div className="flex flex-wrap items-center gap-1">
+                                <span className="font-medium">{r.contact_name}</span>
+                                {r.contact_source === "ai" && (
+                                  <Badge
+                                    variant="secondary"
+                                    className="shrink-0 text-[10px]"
+                                    title="Found via AI extraction, not a direct scrape"
+                                  >
+                                    AI
+                                  </Badge>
+                                )}
+                              </div>
+                            )}
+                            {r.contact_role && (
+                              <div className="text-muted-foreground text-[10px] italic">
+                                {r.contact_role}
+                              </div>
+                            )}
+                            {r.contact_email && (
+                              <div className="flex flex-wrap items-center gap-1">
+                                <a
+                                  href={`mailto:${r.contact_email}`}
+                                  className="text-primary hover:underline"
+                                >
+                                  {r.contact_email}
+                                </a>
+                                {!r.contact_name && r.contact_source === "ai" && (
+                                  <Badge
+                                    variant="secondary"
+                                    className="shrink-0 text-[10px]"
+                                    title="Found via AI extraction, not a direct scrape"
+                                  >
+                                    AI
+                                  </Badge>
+                                )}
+                              </div>
                             )}
                           </div>
-                        ) : r.contact_name ? (
-                          <span className="text-muted-foreground">
-                            {r.contact_name}
-                            {r.contact_source === "ai" && (
-                              <Badge
-                                variant="secondary"
-                                className="ml-1 shrink-0 text-[10px]"
-                                title="Found via AI extraction, not a direct scrape"
-                              >
-                                AI
-                              </Badge>
-                            )}
-                          </span>
                         ) : (
                           <span className="text-muted-foreground">—</span>
                         )}
