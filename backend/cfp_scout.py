@@ -38,6 +38,7 @@ import threading
 import time
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import date, datetime, timedelta
 from typing import Optional
 from urllib.parse import urljoin, urlparse
@@ -473,9 +474,17 @@ def _run_apify_actor(
         status = run_data.get("status", "")
 
         elapsed = 0
+        # No log line fires between the start and end of this loop otherwise
+        # — a run that legitimately takes a few minutes looks indistinguishable
+        # from a genuine hang in the logs. One line every ~30s is enough to
+        # tell "still working" apart from "stuck".
+        last_logged = 0
         while status not in _TERMINAL_RUN_STATUSES and elapsed < max_poll_seconds and run_id:
             time.sleep(poll_interval_seconds)
             elapsed += poll_interval_seconds
+            if elapsed - last_logged >= 30:
+                logger.info(f"[CFP-SCOUT] Apify actor {actor_id} run {run_id} still {status or 'starting'} ({elapsed}s elapsed)")
+                last_logged = elapsed
             poll_resp = requests.get(
                 f"https://api.apify.com/v2/actor-runs/{run_id}",
                 headers={"Authorization": f"Bearer {apify_token}"},
@@ -1254,6 +1263,20 @@ CONTACT_NAME: <name or NONE>"""
 
 _AI_MODEL = "claude-haiku-4-5"
 
+# Root cause of intermittent multi-minute "hangs" with no error/log output:
+# the anthropic SDK's own default is a 600s (10 min) read timeout with 2
+# automatic retries — confirmed via `anthropic.Anthropic(api_key=...).timeout`
+# — so one slow/rate-limited response could silently block a worker for up
+# to ~30 minutes before ever raising (and thus ever logging) anything. This
+# stage is a best-effort last resort on top of a free waterfall that already
+# ran — nothing is lost by failing fast and moving on.
+_AI_CALL_TIMEOUT_SECONDS = 20.0
+_AI_CALL_MAX_RETRIES = 1
+# Extra grace period on top of the client-level timeout for the outer
+# future.result() wait below — gives the client's own timeout+retry logic
+# room to raise cleanly before the outer bound gives up on it too.
+_AI_CALL_OUTER_GRACE_SECONDS = 10.0
+
 
 def _ai_extract_contact(full_text: str, api_key: str) -> dict:
     """Best-effort contact extraction via Claude. Returns {} on failure or nothing found."""
@@ -1261,7 +1284,9 @@ def _ai_extract_contact(full_text: str, api_key: str) -> dict:
         return {}
     try:
         import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
+        client = anthropic.Anthropic(
+            api_key=api_key, timeout=_AI_CALL_TIMEOUT_SECONDS, max_retries=_AI_CALL_MAX_RETRIES,
+        )
         response = client.messages.create(
             model=_AI_MODEL,
             max_tokens=100,
@@ -1315,10 +1340,39 @@ def _enrich_missing_contacts(results: list[dict]) -> list[dict]:
             r["contact_name"] = ai_result["contact_name"]
             r.setdefault("contact_source", "ai")
 
-    with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as executor:
-        list(executor.map(_enrich_one, candidates))
+    logger.info(f"[CFP-SCOUT] AI contact enrichment: starting {len(candidates)} call(s)")
+    completed = 0
+    timed_out = 0
+    # Bound each call individually rather than a blind executor.map(), which
+    # blocks until every future finishes with no cap of its own — belt and
+    # suspenders alongside the client-level timeout above, so a single
+    # unresponsive call degrades that one result instead of stalling the
+    # whole run. Deliberately NOT a `with ThreadPoolExecutor(...) as executor`
+    # block: that calls shutdown(wait=True) on exit, which would still block
+    # here on any thread we already gave up on via future.result(timeout=...)
+    # — defeating the point. shutdown(wait=False) below lets this function
+    # return promptly regardless; an orphaned call finishes in the background
+    # (or the client-level timeout above kills it) rather than blocking the
+    # whole scout run.
+    executor = ThreadPoolExecutor(max_workers=min(8, len(candidates)))
+    try:
+        futures = {executor.submit(_enrich_one, r): r for r in candidates}
+        for future in futures:
+            try:
+                future.result(timeout=_AI_CALL_TIMEOUT_SECONDS + _AI_CALL_OUTER_GRACE_SECONDS)
+                completed += 1
+            except FuturesTimeoutError:
+                timed_out += 1
+                logger.warning("[CFP-SCOUT] AI contact enrichment: one call exceeded the outer timeout — skipped")
+            except Exception as exc:
+                logger.warning(f"[CFP-SCOUT] AI contact enrichment: one call failed — {exc}")
+    finally:
+        executor.shutdown(wait=False)
 
-    logger.info(f"[CFP-SCOUT] AI contact enrichment: {len(candidates)} call(s) made")
+    logger.info(
+        f"[CFP-SCOUT] AI contact enrichment: {completed}/{len(candidates)} call(s) completed"
+        + (f", {timed_out} timed out" if timed_out else "")
+    )
     return results
 
 
