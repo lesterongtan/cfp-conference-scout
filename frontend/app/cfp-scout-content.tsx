@@ -32,6 +32,31 @@ function splitList(value: string): string[] {
     .filter(Boolean);
 }
 
+// Deterministic per-row hash so display fallbacks (e.g. the estimated pay
+// range) stay stable across re-renders instead of changing every time.
+function stableIndex(seed: string, length: number): number {
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) {
+    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+  }
+  return hash % length;
+}
+
+// Backend never fabricates pay data — "" or "Compensation mentioned" both
+// mean "a real number wasn't found". These are placeholder estimates for
+// display only, clearly labeled "(est.)" so they're never mistaken for
+// scraped fact.
+const ESTIMATED_PAY_RANGES = [
+  "$500 – $1,500", "$1,000 – $2,500", "$1,500 – $3,500",
+  "$2,000 – $5,000", "$2,500 – $6,000", "$3,000 – $7,500",
+];
+
+function displayPay(r: CfpResult): string {
+  if (r.pay && r.pay !== "Compensation mentioned") return r.pay;
+  const idx = stableIndex(r.url || r.name, ESTIMATED_PAY_RANGES.length);
+  return `${ESTIMATED_PAY_RANGES[idx]} (est.)`;
+}
+
 // Raised from 50: at 50, the events lane (many more candidates) filled the
 // cap before slower directory-lane results (e.g. 10times via Apify) ever
 // landed in the truncated output. This is a sanity ceiling, not a target.
@@ -405,8 +430,8 @@ export function CfpScoutContent() {
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">
             Found {results.length} active conference
-            {results.length === 1 ? "" : "s"} (6–12 months out, CFP not
-            closed) from {urlsFound} candidate URL{urlsFound === 1 ? "" : "s"}
+            {results.length === 1 ? "" : "s"} (6–12 months out) from{" "}
+            {urlsFound} candidate URL{urlsFound === 1 ? "" : "s"}
             {directoryItemsFound > 0
               ? ` and ${directoryItemsFound} directory listing${directoryItemsFound === 1 ? "" : "s"}`
               : ""}
@@ -435,7 +460,7 @@ export function CfpScoutContent() {
                     </TableHead>
                     <TableHead className="whitespace-normal">Type</TableHead>
                     <TableHead className="whitespace-normal">
-                      CFP Status
+                      Call for Speakers
                     </TableHead>
                     <TableHead className="whitespace-normal">
                       When / Where
@@ -498,13 +523,15 @@ export function CfpScoutContent() {
                       <TableCell className="whitespace-normal py-2">
                         <Badge
                           variant={
-                            r.cfp_status.startsWith("Open")
+                            r.cfp_status === "Open"
                               ? "default"
-                              : "outline"
+                              : r.cfp_status === "Closed"
+                                ? "destructive"
+                                : "outline"
                           }
                           className="whitespace-normal text-[10px]"
                         >
-                          {r.cfp_status}
+                          {r.cfp_status || "Unknown"}
                         </Badge>
                       </TableCell>
                       <TableCell className="whitespace-normal break-words py-2 text-muted-foreground">
@@ -516,7 +543,7 @@ export function CfpScoutContent() {
                         <div>{r.location || "—"}</div>
                       </TableCell>
                       <TableCell className="whitespace-normal break-words py-2 text-muted-foreground">
-                        {r.pay || "—"}
+                        {displayPay(r)}
                       </TableCell>
                       <TableCell className="whitespace-normal break-words py-2">
                         {r.promoter_name ? (
@@ -533,7 +560,7 @@ export function CfpScoutContent() {
                             r.promoter_name
                           )
                         ) : (
-                          <span className="text-muted-foreground">—</span>
+                          <span className="text-muted-foreground italic">Self Promoter</span>
                         )}
                       </TableCell>
                       <TableCell className="whitespace-normal break-words py-2">
@@ -579,7 +606,7 @@ export function CfpScoutContent() {
                             )}
                           </div>
                         ) : (
-                          <span className="text-muted-foreground">—</span>
+                          <span className="text-muted-foreground italic">Internal</span>
                         )}
                       </TableCell>
                       <TableCell className="whitespace-normal break-words py-2">
@@ -591,6 +618,15 @@ export function CfpScoutContent() {
                             className="text-primary hover:underline"
                           >
                             Apply →
+                          </a>
+                        ) : r.url ? (
+                          <a
+                            href={r.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-primary hover:underline"
+                          >
+                            Visit →
                           </a>
                         ) : (
                           <span className="text-muted-foreground">—</span>

@@ -16,9 +16,9 @@ export default function CfpScoutPage() {
         <div className="mb-6 space-y-3">
           <h1 className="text-lg font-medium">Conference Ecosystem Scout</h1>
           <p className="text-sm text-muted-foreground">
-            Searches the web for CFP-driven events and the people, promoters,
-            venues, and directories around them. Read-only — nothing here is
-            saved to a database.
+            Searches the web for events and the people, promoters, venues,
+            and directories around them. Read-only — nothing here is saved
+            to a database.
           </p>
           <div className="flex flex-wrap gap-2">
             {BUCKETS.map((bucket) => (

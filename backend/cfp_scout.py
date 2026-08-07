@@ -12,7 +12,10 @@ dependency on the original repo at all.
 Early-build additions on top of the v1 discovery pass:
   - Event date extraction (schema.org JSON-LD first, free-text regex fallback)
     and a 6-12 month "active window" filter, with confidence labeling.
-  - A CFP-closed heuristic so expired/closed calls don't show as active.
+  - A CFP-closed heuristic — informational (Open/Closed/Unknown), not a
+    filter: events stay in the results even when their CFP has closed,
+    since the Events bucket covers conferences/summits/etc. generally, not
+    only ones currently accepting speakers.
   - Domain-based deduplication (official domain as the dedup key).
   - A "directories" discovery lane via Apify. Verified and ready to use with
     zen-studio~10times-events-scraper (real query/date input schema, real
@@ -188,6 +191,23 @@ def _detect_cfp_closed(text: str) -> bool:
     if not text:
         return False
     return any(p.search(text) for p in _CFP_CLOSED_PATTERNS)
+
+
+def _classify_cfp_status(full_text: str, has_cfp: bool) -> str:
+    """Open / Closed / Unknown — informational only, no longer a filter.
+
+    Previously a detected-closed CFP dropped the event entirely, which
+    meant "Closed" could never actually show up as a result — the Events
+    bucket is "conferences, summits, forums, annual meetings, and related
+    programs" per spec, not "only ones with an open CFP", so closed-CFP
+    events now stay in the results with their real status instead of
+    silently vanishing.
+    """
+    if _detect_cfp_closed(full_text):
+        return "Closed"
+    if has_cfp:
+        return "Open"
+    return "Unknown"
 
 
 # ── Date parsing ─────────────────────────────────────────────────────────────
@@ -861,9 +881,6 @@ def _process_directory_item(
     description = item.get("description") or (scraped.get("description") if scraped else "")
     full_text = scraped.get("full_text", "") if scraped else ""
 
-    if _detect_cfp_closed(full_text):
-        return None
-
     event_date, date_confidence = _resolve_event_date(
         text_date_raw=scraped_date_raw,
         jsonld_start_date=structured_date_raw,
@@ -880,7 +897,7 @@ def _process_directory_item(
         "lane": "directories",
         "found_via": "Apify Directory",
         "found_at": _domain_of(url),
-        "cfp_status": "Open — Call for Speakers" if has_cfp else "Unknown",
+        "cfp_status": _classify_cfp_status(full_text, has_cfp),
         "description": description,
         "location": location,
         "event_date": event_date.isoformat() if event_date else "",
@@ -967,15 +984,17 @@ def _process_confs_tech_entry(
     if window_status in ("expired", "too_far_out", "too_soon"):
         return None
 
+    # A passed CFP deadline no longer drops the event — see
+    # _classify_cfp_status: the event itself can still be worth surfacing
+    # (Events bucket per spec), it just gets marked Closed instead of
+    # silently vanishing.
     cfp_end = _parse_iso_date(entry.get("cfpEndDate", ""))
     if cfp_end and cfp_end < date.today():
-        return None  # CFP deadline confirmed passed — not active
-
-    cfp_status = (
-        "Open — Call for Speakers"
-        if entry.get("cfpUrl") and (cfp_end is None or cfp_end >= date.today())
-        else "Unknown"
-    )
+        cfp_status = "Closed"
+    elif entry.get("cfpUrl"):
+        cfp_status = "Open"
+    else:
+        cfp_status = "Unknown"
     location = ", ".join(p for p in (entry.get("city", ""), entry.get("country", "")) if p)
 
     return {
@@ -1424,9 +1443,6 @@ def _process_event_url(
     if not scraped:
         return None
 
-    if _detect_cfp_closed(scraped.get("full_text", "")):
-        return None
-
     jsonld = _fetch_jsonld_event(url)
     event_date, date_confidence = _resolve_event_date(
         text_date_raw=scraped.get("event_date_raw", ""),
@@ -1447,7 +1463,7 @@ def _process_event_url(
         "lane": "events",
         "found_via": source_backend,
         "found_at": _domain_of(url),
-        "cfp_status": "Open — Call for Speakers" if scraped.get("has_cfp") else "Unknown",
+        "cfp_status": _classify_cfp_status(scraped.get("full_text", ""), bool(scraped.get("has_cfp"))),
         "description": scraped.get("description", ""),
         "location": location,
         "event_date": event_date.isoformat() if event_date else "",
@@ -1499,15 +1515,18 @@ def run_cfp_discovery(
     event_formats: Optional[list[str]] = None,
     exclusions: Optional[list[str]] = None,
 ) -> dict:
-    """Search + lightly scrape for active conferences/CFPs matching keywords.
+    """Search + lightly scrape for events/conferences matching keywords.
 
-    Filters out CFPs detected as closed and events outside the active date
-    window (expired, too soon, or beyond max_days_out — defaults to 6-12
-    months out). Events with no confidently-parsed date are kept
-    (window_status='unknown') rather than silently dropped, since date
-    extraction is best-effort. `event_formats`, if given, filters similarly
-    without dropping results whose format couldn't be inferred. `exclusions`
-    drops any result whose name/description/promoter/domain matches a term.
+    Filters out events outside the active date window (expired, too soon,
+    or beyond max_days_out — defaults to 6-12 months out). Whether an
+    event's call for speakers is Open/Closed/Unknown is informational only
+    (cfp_status on each result) and no longer excludes it — the Events
+    bucket covers conferences/summits/etc. generally. Events with no
+    confidently-parsed date are kept (window_status='unknown') rather than
+    silently dropped, since date extraction is best-effort. `event_formats`,
+    if given, filters similarly without dropping results whose format
+    couldn't be inferred. `exclusions` drops any result whose
+    name/description/promoter/domain matches a term.
 
     This is Phase 1 (discovery) only — profile fields (geography, date
     window, formats, exclusions) shape which candidates get found and kept,
